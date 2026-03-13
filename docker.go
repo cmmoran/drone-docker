@@ -319,17 +319,24 @@ func (p Plugin) Exec() error {
 		fmt.Printf("Could not create adaptive card. %s\n", err)
 	}
 
-	if p.ArtifactFile != "" {
-		if digest, err := getDigest(p.Build.TempTag); err == nil {
-			if err = drone.WritePluginArtifactFile(p.Daemon.RegistryType, p.ArtifactFile, p.Daemon.Registry, p.Build.Repo, digest, p.Build.Tags); err != nil {
-				fmt.Printf("failed to write plugin artifact file at path: %s with error: %s\n", p.ArtifactFile, err)
-			}
+	digest := ""
+	if !p.Dryrun {
+		if value, err := getDigest(p.Build.TempTag); err == nil {
+			digest = value
 		} else {
 			fmt.Printf("Could not fetch the digest. %s\n", err)
 		}
 	}
 
-	if err := p.writeOutputs(); err != nil {
+	if p.ArtifactFile != "" {
+		if digest != "" {
+			if err := drone.WritePluginArtifactFile(p.Daemon.RegistryType, p.ArtifactFile, p.Daemon.Registry, p.Build.Repo, digest, p.Build.Tags); err != nil {
+				fmt.Printf("failed to write plugin artifact file at path: %s with error: %s\n", p.ArtifactFile, err)
+			}
+		}
+	}
+
+	if err := p.writeOutputs(buildOutputContext(p.Build.Repo, p.Build.Tags, digest)); err != nil {
 		return err
 	}
 
@@ -338,7 +345,7 @@ func (p Plugin) Exec() error {
 		// Set up environment variables for cosign
 		os.Setenv("COSIGN_YES", "true")
 
-		if digest, err := getDigest(p.Build.TempTag); err == nil {
+		if digest != "" {
 			fmt.Printf("🔐 Found image digest: %s\n", digest)
 
 			// Sign with digest reference
@@ -346,7 +353,7 @@ func (p Plugin) Exec() error {
 			cosignCmd := createCosignCommand(imageRef, p.Cosign)
 			executeCosignCommand(cosignCmd)
 		} else {
-			fmt.Printf("⚠️  WARNING: Could not get image digest for cosign signing: %s\n", err)
+			fmt.Printf("⚠️  WARNING: Could not get image digest for cosign signing\n")
 			fmt.Printf("   Falling back to tag-based signing\n")
 
 			// Fall back to tag-based signing for each tag
@@ -385,8 +392,34 @@ type exportedOutput struct {
 	Value any
 }
 
-func (p Plugin) writeOutputs() error {
-	exports, err := p.resolveOutputs()
+type outputContext struct {
+	Digest          string
+	ImageRefs       []string
+	PrimaryImageRef string
+	ImageWithDigest string
+}
+
+func buildOutputContext(repo string, tags []string, digest string) outputContext {
+	imageRefs := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		imageRefs = append(imageRefs, fmt.Sprintf("%s:%s", repo, tag))
+	}
+
+	ctx := outputContext{
+		Digest:    digest,
+		ImageRefs: imageRefs,
+	}
+	if len(imageRefs) > 0 {
+		ctx.PrimaryImageRef = imageRefs[0]
+	}
+	if digest != "" {
+		ctx.ImageWithDigest = fmt.Sprintf("%s@%s", repo, digest)
+	}
+	return ctx
+}
+
+func (p Plugin) writeOutputs(ctx outputContext) error {
+	exports, err := p.resolveOutputs(ctx)
 	if err != nil {
 		return err
 	}
@@ -406,19 +439,23 @@ func (p Plugin) writeOutputs() error {
 	return nil
 }
 
-func (p Plugin) resolveOutputs() ([]exportedOutput, error) {
+func (p Plugin) resolveOutputs(ctx outputContext) ([]exportedOutput, error) {
 	exports := make([]exportedOutput, 0, len(p.Outputs))
+	fromSecretKeys := loadPluginKeySet("PLUGIN_FROM_SECRET_KEYS")
 	for _, spec := range p.Outputs {
 		key, source, err := parseOutputSpec(spec)
 		if err != nil {
 			return nil, err
 		}
-		if isBlockedOutputSource(source) {
+		value, kind, available, ok := p.resolveOutputValue(source, ctx)
+		if kind == outputSourceSetting && isBlockedSettingSource(source, fromSecretKeys) {
 			return nil, fmt.Errorf("refusing to export blocked output source %q", source)
 		}
-		value, ok := p.outputValue(source)
 		if !ok {
 			return nil, fmt.Errorf("unsupported output source %q in %q", source, spec)
+		}
+		if !available {
+			return nil, fmt.Errorf("output source %q is unavailable for this run", source)
 		}
 		exports = append(exports, exportedOutput{
 			Key:   key,
@@ -450,9 +487,36 @@ func normalizeOutputSource(source string) string {
 	return source
 }
 
-func isBlockedOutputSource(source string) bool {
-	source = normalizeOutputSource(source)
+type outputSourceKind int
 
+const (
+	outputSourceUnsupported outputSourceKind = iota
+	outputSourceRuntime
+	outputSourceSetting
+)
+
+func loadPluginKeySet(envName string) map[string]struct{} {
+	raw := strings.TrimSpace(os.Getenv(envName))
+	if raw == "" {
+		return nil
+	}
+	keys := map[string]struct{}{}
+	for _, part := range strings.Split(raw, ",") {
+		part = normalizeOutputSource(part)
+		if part != "" {
+			keys[part] = struct{}{}
+		}
+	}
+	return keys
+}
+
+func isBlockedSettingSource(source string, fromSecretKeys map[string]struct{}) bool {
+	source = normalizeOutputSource(source)
+	source = strings.TrimPrefix(source, "settings.")
+
+	if _, ok := fromSecretKeys[source]; ok {
+		return true
+	}
 	switch source {
 	case
 		"username",
@@ -487,7 +551,35 @@ func isBlockedOutputSource(source string) bool {
 	return false
 }
 
-func (p Plugin) outputValue(source string) (any, bool) {
+func (p Plugin) resolveOutputValue(source string, ctx outputContext) (any, outputSourceKind, bool, bool) {
+	normalized := normalizeOutputSource(source)
+	if strings.HasPrefix(normalized, "settings.") {
+		value, ok := p.settingOutputValue(strings.TrimPrefix(normalized, "settings."))
+		return value, outputSourceSetting, ok, ok
+	}
+	if value, available, ok := p.runtimeOutputValue(normalized, ctx); ok {
+		return value, outputSourceRuntime, available, true
+	}
+	value, ok := p.settingOutputValue(normalized)
+	return value, outputSourceSetting, ok, ok
+}
+
+func (p Plugin) runtimeOutputValue(source string, ctx outputContext) (any, bool, bool) {
+	switch source {
+	case "digest":
+		return ctx.Digest, ctx.Digest != "", true
+	case "image_refs":
+		return ctx.ImageRefs, len(ctx.ImageRefs) > 0, true
+	case "primary_image_ref":
+		return ctx.PrimaryImageRef, ctx.PrimaryImageRef != "", true
+	case "image_with_digest":
+		return ctx.ImageWithDigest, ctx.ImageWithDigest != "", true
+	default:
+		return nil, false, false
+	}
+}
+
+func (p Plugin) settingOutputValue(source string) (any, bool) {
 	switch normalizeOutputSource(source) {
 	case "repo":
 		return p.Build.Repo, true
@@ -1264,7 +1356,7 @@ func (p Plugin) pushOnly() error {
 		}
 	}
 
-	if err := p.writeOutputs(); err != nil {
+	if err := p.writeOutputs(buildOutputContext(p.Build.Repo, p.Build.Tags, digest)); err != nil {
 		return err
 	}
 

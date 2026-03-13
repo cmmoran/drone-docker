@@ -98,8 +98,14 @@ steps:
 
 ### Publishing step outputs
 
-This fork can publish selected plugin settings as step outputs when the runner
-injects the `drone-output` helper.
+This fork can publish selected plugin settings and runtime image results as
+step outputs for downstream steps.
+
+This feature is only useful with the corresponding `drone-runner-docker` fork
+at `~/code/cmmoran/drone-runner-docker`. That runner injects the
+`drone-output` helper, resolves downstream `from_output` references, and tells
+the plugin which settings were provided via `from_secret` using
+`PLUGIN_FROM_SECRET_KEYS`.
 
 ```yaml
 steps:
@@ -114,27 +120,88 @@ steps:
     - org.opencontainers.image.title=hello-world
     outputs:
     - tags
-    - labels
-    - outputs.image_repo=repo
+    - digest
+    - image_refs
+    - primary_image_ref
+    - image_with_digest
+    - outputs.image_repo=settings.repo
+
+- name: use-image-metadata
+  image: alpine
+  environment:
+    FIRST_TAG:
+      from_output: build-and-push.tags.0
+    DIGEST:
+      from_output: build-and-push.digest
+    IMAGE_REF:
+      from_output: build-and-push.primary_image_ref
+    IMAGE_WITH_DIGEST:
+      from_output: build-and-push.image_with_digest
+    IMAGE_REPO:
+      from_output: build-and-push.outputs.image_repo
 ```
 
-The `outputs` list supports two forms:
+The `outputs` list supports these forms:
 
-- `tags` publishes the value of the `tags` setting as the `tags` output.
-- `outputs.image_repo=repo` publishes the value of the `repo` setting as the
-  `outputs.image_repo` output.
+- `tags`
+  Publishes a supported output source by name. For setting-backed sources, the
+  plugin resolves this like `settings.tags`.
+- `settings.repo`
+  Publishes an explicit setting-backed source.
+- `outputs.image_repo=settings.repo`
+  Publishes the value of `settings.repo` as the `outputs.image_repo` output.
 
 Downstream steps can then consume these values with `from_output`, for example
-`build-and-push.tags.0` or `build-and-push.outputs.image_repo`.
+`build-and-push.tags.0`, `build-and-push.digest`, or
+`build-and-push.outputs.image_repo`.
+
+First-class runtime outputs:
+
+- `digest`
+  The pushed image digest, for example `sha256:...`
+- `image_refs`
+  The pushed tag refs as `repo:tag` values
+- `primary_image_ref`
+  The first pushed `repo:tag` value
+- `image_with_digest`
+  The canonical immutable ref as `repo@sha256:...`
+
+Supported setting-backed outputs include:
+
+- `repo`
+- `tags`
+- `labels`
+- `label_schema`
+- `dockerfile`
+- `context`
+- `args`
+- `args_from_env`
+- `target`
+- `cache_from`
+- `platform`
+- `dry_run`
+- `push_only`
+- `source_image`
+- `artifact_file`
+
+Behavior:
+
+- String settings are published as plain output values.
+- List settings are published as indexed outputs.
+  Example: `tags` becomes `tags.0`, `tags.1`, and so on.
+- Boolean and numeric values are published as JSON-formatted values.
+- Runtime outputs are only available when the step actually produced them.
+  Example: `digest` requires a successful non-dry-run push.
+- Invalid, blocked, or unavailable output sources fail the step.
 
 Security guardrails:
 
-- sensitive settings are blocked from `outputs` entirely, including registry
-  credentials, access tokens, secret inputs, SSH keys, docker config, base
-  image credentials, and cosign private-key/password fields
-- because the plugin does not receive `from_secret` provenance metadata from
-  the runner, this protection is enforced by sensitive setting name rather than
-  by original YAML source annotation
+- `settings.X` outputs are blocked when the runner marks `X` in
+  `PLUGIN_FROM_SECRET_KEYS`
+- when runner metadata is absent, the plugin falls back to a conservative
+  sensitive-name denylist for registry credentials, access tokens, secret
+  inputs, SSH keys, docker config, base image credentials, and cosign
+  private-key/password fields
 
 Using a dockerfile that references the secret-file 
 
