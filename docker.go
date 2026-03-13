@@ -1,12 +1,14 @@
 package docker
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -90,6 +92,7 @@ type (
 		Build             Build        // Docker build configuration
 		Daemon            Daemon       // Docker daemon configuration
 		Cosign            CosignConfig // Cosign signing configuration
+		Outputs           []string     // Step outputs to publish via drone-output
 		Dryrun            bool         // Docker push is skipped
 		Cleanup           bool         // Docker purge is enabled
 		CardPath          string       // Card path to write file to
@@ -128,6 +131,8 @@ type (
 		Tag string `json:"Tag"`
 	}
 )
+
+var outputCommand = exec.Command
 
 // Exec executes the plugin step
 func (p Plugin) Exec() error {
@@ -324,6 +329,10 @@ func (p Plugin) Exec() error {
 		}
 	}
 
+	if err := p.writeOutputs(); err != nil {
+		return err
+	}
+
 	// Handle cosign signing after all commands complete (like artifact generation)
 	if p.shouldSignWithCosign() && !p.Dryrun {
 		// Set up environment variables for cosign
@@ -331,7 +340,7 @@ func (p Plugin) Exec() error {
 
 		if digest, err := getDigest(p.Build.TempTag); err == nil {
 			fmt.Printf("🔐 Found image digest: %s\n", digest)
-			
+
 			// Sign with digest reference
 			imageRef := fmt.Sprintf("%s@%s", p.Build.Repo, digest)
 			cosignCmd := createCosignCommand(imageRef, p.Cosign)
@@ -339,7 +348,7 @@ func (p Plugin) Exec() error {
 		} else {
 			fmt.Printf("⚠️  WARNING: Could not get image digest for cosign signing: %s\n", err)
 			fmt.Printf("   Falling back to tag-based signing\n")
-			
+
 			// Fall back to tag-based signing for each tag
 			for _, tag := range p.Build.Tags {
 				imageRef := fmt.Sprintf("%s:%s", p.Build.Repo, tag)
@@ -354,8 +363,12 @@ func (p Plugin) Exec() error {
 		// clear the slice
 		cmds = nil
 
-		cmds = append(cmds, commandRmi(p.Build.TempTag)) // docker rmi
-		cmds = append(cmds, commandPrune())              // docker system prune -f
+		rmiCmd := p.Build.TempTag
+		if !strings.HasSuffix(rmiCmd, ":latest") {
+			rmiCmd = fmt.Sprintf("%s:latest", rmiCmd)
+		}
+		cmds = append(cmds, commandRmi(rmiCmd)) // docker rmi
+		cmds = append(cmds, commandPrune())     // docker system prune -f
 
 		for _, cmd := range cmds {
 			cmd.Stdout = os.Stdout
@@ -365,6 +378,225 @@ func (p Plugin) Exec() error {
 	}
 
 	return nil
+}
+
+type exportedOutput struct {
+	Key   string
+	Value any
+}
+
+func (p Plugin) writeOutputs() error {
+	exports, err := p.resolveOutputs()
+	if err != nil {
+		return err
+	}
+	for _, export := range exports {
+		args, err := outputCommandArgs(export.Key, export.Value)
+		if err != nil {
+			return err
+		}
+		cmd := outputCommand("drone-output", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		trace(cmd)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to publish output %q: %w", export.Key, err)
+		}
+	}
+	return nil
+}
+
+func (p Plugin) resolveOutputs() ([]exportedOutput, error) {
+	exports := make([]exportedOutput, 0, len(p.Outputs))
+	for _, spec := range p.Outputs {
+		key, source, err := parseOutputSpec(spec)
+		if err != nil {
+			return nil, err
+		}
+		if isBlockedOutputSource(source) {
+			return nil, fmt.Errorf("refusing to export blocked output source %q", source)
+		}
+		value, ok := p.outputValue(source)
+		if !ok {
+			return nil, fmt.Errorf("unsupported output source %q in %q", source, spec)
+		}
+		exports = append(exports, exportedOutput{
+			Key:   key,
+			Value: value,
+		})
+	}
+	return exports, nil
+}
+
+func parseOutputSpec(spec string) (string, string, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return "", "", errors.New("empty output spec")
+	}
+	if key, source, ok := strings.Cut(spec, "="); ok {
+		key = strings.TrimSpace(key)
+		source = strings.TrimSpace(source)
+		if key == "" || source == "" {
+			return "", "", fmt.Errorf("invalid output spec %q", spec)
+		}
+		return key, source, nil
+	}
+	return spec, spec, nil
+}
+
+func normalizeOutputSource(source string) string {
+	source = strings.TrimSpace(strings.ToLower(source))
+	source = strings.ReplaceAll(source, "-", "_")
+	return source
+}
+
+func isBlockedOutputSource(source string) bool {
+	source = normalizeOutputSource(source)
+
+	switch source {
+	case
+		"username",
+		"docker_username",
+		"password",
+		"docker_password",
+		"config",
+		"docker_config",
+		"access_token",
+		"secret",
+		"secrets_from_env",
+		"secrets_from_file",
+		"ssh_agent_key",
+		"base_image_username",
+		"base_image_password",
+		"cosign_private_key",
+		"cosign.private_key",
+		"cosign_password",
+		"cosign.password":
+		return true
+	}
+
+	for _, part := range strings.FieldsFunc(source, func(r rune) bool {
+		return r == '_' || r == '.'
+	}) {
+		switch part {
+		case "secret", "secrets", "password", "token", "private", "key", "config", "credential", "credentials":
+			return true
+		}
+	}
+
+	return false
+}
+
+func (p Plugin) outputValue(source string) (any, bool) {
+	switch normalizeOutputSource(source) {
+	case "repo":
+		return p.Build.Repo, true
+	case "tags":
+		return p.Build.Tags, true
+	case "labels", "custom_labels":
+		return p.Build.Labels, true
+	case "label_schema":
+		return p.Build.LabelSchema, true
+	case "dockerfile":
+		return p.Build.Dockerfile, true
+	case "context":
+		return p.Build.Context, true
+	case "args", "build_args":
+		return p.Build.Args, true
+	case "args_from_env", "build_args_from_env":
+		return p.Build.ArgsEnv, true
+	case "target":
+		return p.Build.Target, true
+	case "cache_from":
+		return p.Build.CacheFrom, true
+	case "squash":
+		return p.Build.Squash, true
+	case "pull", "pull_image":
+		return p.Build.Pull, true
+	case "compress":
+		return p.Build.Compress, true
+	case "link", "repo_link":
+		return p.Build.Link, true
+	case "no_cache":
+		return p.Build.NoCache, true
+	case "secret":
+		return p.Build.Secret, true
+	case "secrets_from_env":
+		return p.Build.SecretEnvs, true
+	case "secrets_from_file":
+		return p.Build.SecretFiles, true
+	case "add_host":
+		return p.Build.AddHost, true
+	case "quiet":
+		return p.Build.Quiet, true
+	case "platform":
+		return p.Build.Platform, true
+	case "ssh_agent_key":
+		return p.Build.SSHAgentKey, true
+	case "username", "docker_username":
+		return p.Login.Username, true
+	case "password", "docker_password":
+		return p.Login.Password, true
+	case "registry", "docker_registry":
+		return p.Login.Registry, true
+	case "email", "docker_email":
+		return p.Login.Email, true
+	case "config", "docker_config":
+		return p.Login.Config, true
+	case "access_token":
+		return p.Login.AccessToken, true
+	case "dry_run":
+		return p.Dryrun, true
+	case "push_only":
+		return p.PushOnly, true
+	case "source_image":
+		return p.SourceImage, true
+	case "artifact_file":
+		return p.ArtifactFile, true
+	case "retry_count", "daemon_retry_count":
+		return p.Daemon.RetryCount, true
+	case "registry_type":
+		return string(p.Daemon.RegistryType), true
+	case "base_image_registry":
+		return p.BaseImageRegistry, true
+	case "base_image_username":
+		return p.BaseImageUsername, true
+	case "base_image_password":
+		return p.BaseImagePassword, true
+	case "cosign_private_key", "cosign.private_key":
+		return p.Cosign.PrivateKey, true
+	case "cosign_password", "cosign.password":
+		return p.Cosign.Password, true
+	case "cosign_params", "cosign.params":
+		return p.Cosign.Params, true
+	default:
+		return nil, false
+	}
+}
+
+func outputCommandArgs(key string, value any) ([]string, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, errors.New("empty output key")
+	}
+	args := []string{"set"}
+	switch typed := value.(type) {
+	case string:
+		args = append(args, key, typed)
+	case []string, bool:
+		raw, err := json.Marshal(typed)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--format", "json", key, string(raw))
+	default:
+		raw, err := json.Marshal(typed)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--format", "json", key, string(raw))
+	}
+	return args, nil
 }
 
 // helper function to set the credentials
@@ -585,14 +817,20 @@ func addProxyBuildArgs(build *Build) {
 func addProxyValue(build *Build, key string) {
 	value := getProxyValue(key)
 
-	if len(value) > 0 && !hasProxyBuildArg(build, key) {
-		build.Args = append(build.Args, fmt.Sprintf("%s=%s", key, value))
-		build.Args = append(build.Args, fmt.Sprintf("%s=%s", strings.ToUpper(key), value))
+	f := func(has func(*Build, string) bool, args []string) []string {
+		if len(value) > 0 && !has(build, key) {
+			args = append(args, fmt.Sprintf("%s=%s", key, value))
+			ukey := strings.ToUpper(key)
+			ukeyValue := fmt.Sprintf("%s=%s", ukey, value)
+			if !slices.Contains(args, ukeyValue) {
+				args = append(args, ukeyValue)
+			}
+		}
+		return args
 	}
-	if len(value) > 0 && !hasProxyBuildArgNew(build, key) {
-		build.ArgsNew = append(build.ArgsNew, fmt.Sprintf("%s=%s", key, value))
-		build.ArgsNew = append(build.ArgsNew, fmt.Sprintf("%s=%s", strings.ToUpper(key), value))
-	}
+
+	build.Args = f(hasProxyBuildArg, build.Args)
+	build.ArgsNew = f(hasProxyBuildArgNew, build.ArgsNew)
 }
 
 // helper function to get a proxy value from the environment.
@@ -723,7 +961,7 @@ func isCommandCosign(args []string) bool {
 }
 
 func commandRmi(tag string) *exec.Cmd {
-	return exec.Command(dockerExe, "rmi", tag)
+	return exec.Command(dockerExe, "rmi", "-f", "--no-prune", tag)
 }
 
 func writeSSHPrivateKey(key string) (path string, err error) {
@@ -853,7 +1091,7 @@ func isValidPEMKey(pemContent string) bool {
 // createCosignCommand creates a cosign sign command with the given image reference
 func createCosignCommand(imageRef string, cosign CosignConfig) *exec.Cmd {
 	args := []string{"sign", "--yes"}
-	
+
 	// Handle private key (content vs file path)
 	if strings.HasPrefix(cosign.PrivateKey, "-----BEGIN") {
 		args = append(args, "--key", "env://COSIGN_PRIVATE_KEY")
@@ -861,21 +1099,21 @@ func createCosignCommand(imageRef string, cosign CosignConfig) *exec.Cmd {
 	} else {
 		args = append(args, "--key", cosign.PrivateKey)
 	}
-	
+
 	// Set password if provided
 	if cosign.Password != "" {
 		os.Setenv("COSIGN_PASSWORD", cosign.Password)
 	}
-	
+
 	// Add any extra parameters
 	if cosign.Params != "" {
 		extraArgs := strings.Fields(cosign.Params)
 		args = append(args, extraArgs...)
 	}
-	
+
 	// Add the image reference to sign
 	args = append(args, imageRef)
-	
+
 	return exec.Command(cosignExe, args...)
 }
 
@@ -1024,6 +1262,10 @@ func (p Plugin) pushOnly() error {
 			fmt.Printf("Failed to write plugin artifact file at path: %s with error: %s\n",
 				p.ArtifactFile, err)
 		}
+	}
+
+	if err := p.writeOutputs(); err != nil {
+		return err
 	}
 
 	// Handle cosign signing after push

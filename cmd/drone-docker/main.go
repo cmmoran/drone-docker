@@ -11,11 +11,8 @@ import (
 	"github.com/urfave/cli"
 
 	docker "github.com/drone-plugins/drone-docker"
+	pluginversion "github.com/drone-plugins/drone-docker/version"
 	"github.com/drone-plugins/drone-plugin-lib/drone"
-)
-
-var (
-	version = "unknown"
 )
 
 func main() {
@@ -28,7 +25,7 @@ func main() {
 	app.Name = "docker plugin"
 	app.Usage = "docker plugin"
 	app.Action = run
-	app.Version = version
+	app.Version = pluginversion.Version
 	app.Flags = []cli.Flag{
 		cli.BoolFlag{
 			Name:   "dry-run",
@@ -209,6 +206,11 @@ func main() {
 			EnvVar: "PLUGIN_CUSTOM_LABELS",
 		},
 		cli.StringSliceFlag{
+			Name:   "outputs",
+			Usage:  "publish selected settings as step outputs via drone-output",
+			EnvVar: "PLUGIN_OUTPUTS",
+		},
+		cli.StringSliceFlag{
 			Name:   "label-schema",
 			Usage:  "label-schema labels",
 			EnvVar: "PLUGIN_LABEL_SCHEMA",
@@ -381,6 +383,7 @@ func run(c *cli.Context) error {
 		},
 		CardPath:     c.String("drone-card-path"),
 		ArtifactFile: c.String("artifact-file"),
+		Outputs:      c.StringSlice("outputs"),
 		Build: docker.Build{
 			Remote:              c.String("remote.url"),
 			Name:                c.String("commit.sha"),

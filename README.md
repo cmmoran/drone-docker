@@ -96,6 +96,46 @@ steps:
       from_secret: docker_password
 ```
 
+### Publishing step outputs
+
+This fork can publish selected plugin settings as step outputs when the runner
+injects the `drone-output` helper.
+
+```yaml
+steps:
+- name: build-and-push
+  image: plugins/docker
+  settings:
+    repo: octocat/hello-world
+    tags:
+    - latest
+    - 1.2.3
+    labels:
+    - org.opencontainers.image.title=hello-world
+    outputs:
+    - tags
+    - labels
+    - outputs.image_repo=repo
+```
+
+The `outputs` list supports two forms:
+
+- `tags` publishes the value of the `tags` setting as the `tags` output.
+- `outputs.image_repo=repo` publishes the value of the `repo` setting as the
+  `outputs.image_repo` output.
+
+Downstream steps can then consume these values with `from_output`, for example
+`build-and-push.tags.0` or `build-and-push.outputs.image_repo`.
+
+Security guardrails:
+
+- sensitive settings are blocked from `outputs` entirely, including registry
+  credentials, access tokens, secret inputs, SSH keys, docker config, base
+  image credentials, and cosign private-key/password fields
+- because the plugin does not receive `from_secret` provenance metadata from
+  the runner, this protection is enforced by sensitive setting name rather than
+  by original YAML source annotation
+
 Using a dockerfile that references the secret-file 
 
 ```bash
@@ -189,4 +229,3 @@ docker run -it --rm -v "$(pwd)":/usr/local/src/your-app githubchangeloggenerator
 ```
 
 Create your pull request for the release. Get it merged then tag the release.
-

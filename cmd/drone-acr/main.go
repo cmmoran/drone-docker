@@ -21,6 +21,7 @@ import (
 
 	docker "github.com/drone-plugins/drone-docker"
 	azureutil "github.com/drone-plugins/drone-docker/internal/azure"
+	pluginversion "github.com/drone-plugins/drone-docker/version"
 )
 
 type subscriptionUrlResponse struct {
@@ -48,6 +49,8 @@ var (
 )
 
 func main() {
+	logrus.WithField("version", pluginversion.Version).Info("starting drone-acr")
+
 	// Load env-file if it exists first
 	if env := os.Getenv("PLUGIN_ENV_FILE"); env != "" {
 		godotenv.Load(env)

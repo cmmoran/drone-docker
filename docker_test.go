@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"reflect"
@@ -219,7 +220,7 @@ func TestGetProxyValue(t *testing.T) {
 			name: "lowercase takes precedence over uppercase",
 			key:  "no_proxy",
 			envVars: map[string]string{
-				"no_proxy":        "localhost,127.0.0.1",
+				"no_proxy":         "localhost,127.0.0.1",
 				"NO_PROXY":         "*.example.com",
 				"HARNESS_NO_PROXY": "*.local",
 			},
@@ -229,7 +230,7 @@ func TestGetProxyValue(t *testing.T) {
 			name: "lowercase takes precedence over HARNESS",
 			key:  "https_proxy",
 			envVars: map[string]string{
-				"https_proxy":        "https://standard:8080",
+				"https_proxy":         "https://standard:8080",
 				"HARNESS_HTTPS_PROXY": "https://harness:8080",
 			},
 			expected: "https://standard:8080",
@@ -265,5 +266,133 @@ func TestGetProxyValue(t *testing.T) {
 				t.Errorf("getProxyValue(%q) = %q, want %q", tt.key, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestResolveOutputs(t *testing.T) {
+	plugin := Plugin{
+		Outputs: []string{
+			"tags",
+			"labels",
+			"outputs.image_repo=repo",
+			"outputs.publish_enabled=dry_run",
+		},
+		Build: Build{
+			Repo:   "octocat/hello-world",
+			Tags:   []string{"latest", "1.2.3"},
+			Labels: []string{"org.opencontainers.image.title=hello-world"},
+		},
+		Dryrun: true,
+	}
+
+	got, err := plugin.resolveOutputs()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []exportedOutput{
+		{Key: "tags", Value: []string{"latest", "1.2.3"}},
+		{Key: "labels", Value: []string{"org.opencontainers.image.title=hello-world"}},
+		{Key: "outputs.image_repo", Value: "octocat/hello-world"},
+		{Key: "outputs.publish_enabled", Value: true},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolveOutputs() got %#v want %#v", got, want)
+	}
+}
+
+func TestResolveOutputsUnknownSource(t *testing.T) {
+	plugin := Plugin{Outputs: []string{"outputs.foo=does_not_exist"}}
+	_, err := plugin.resolveOutputs()
+	if err == nil || !strings.Contains(err.Error(), "unsupported output source") {
+		t.Fatalf("expected unsupported output source error, got %v", err)
+	}
+}
+
+func TestResolveOutputsBlockedSource(t *testing.T) {
+	plugin := Plugin{
+		Outputs: []string{"outputs.registry_password=password"},
+		Login: Login{
+			Password: "super-secret",
+		},
+	}
+
+	_, err := plugin.resolveOutputs()
+	if err == nil || !strings.Contains(err.Error(), "refusing to export blocked output source") {
+		t.Fatalf("expected blocked output source error, got %v", err)
+	}
+}
+
+func TestOutputCommandArgs(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value any
+		want  []string
+	}{
+		{
+			name:  "string",
+			key:   "repo",
+			value: "octocat/hello-world",
+			want:  []string{"set", "repo", "octocat/hello-world"},
+		},
+		{
+			name:  "slice",
+			key:   "tags",
+			value: []string{"latest", "1.2.3"},
+			want:  []string{"set", "--format", "json", "tags", "[\"latest\",\"1.2.3\"]"},
+		},
+		{
+			name:  "bool",
+			key:   "outputs.publish_enabled",
+			value: true,
+			want:  []string{"set", "--format", "json", "outputs.publish_enabled", "true"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := outputCommandArgs(tc.key, tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("outputCommandArgs() got %#v want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWriteOutputs(t *testing.T) {
+	plugin := Plugin{
+		Outputs: []string{"tags", "outputs.image_repo=repo"},
+		Build: Build{
+			Repo: "octocat/hello-world",
+			Tags: []string{"latest", "1.2.3"},
+		},
+	}
+
+	var commands [][]string
+	original := outputCommand
+	outputCommand = func(name string, args ...string) *exec.Cmd {
+		commands = append(commands, append([]string{name}, args...))
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	defer func() {
+		outputCommand = original
+	}()
+
+	if err := plugin.writeOutputs(); err != nil {
+		t.Fatal(err)
+	}
+
+	want := [][]string{
+		{"drone-output", "set", "--format", "json", "tags", "[\"latest\",\"1.2.3\"]"},
+		{"drone-output", "set", "outputs.image_repo", "octocat/hello-world"},
+	}
+
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("writeOutputs() got %s want %s", fmt.Sprintf("%#v", commands), fmt.Sprintf("%#v", want))
 	}
 }

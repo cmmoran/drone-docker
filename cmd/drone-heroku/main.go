@@ -6,9 +6,14 @@ import (
 	"path"
 
 	"github.com/joho/godotenv"
+	"github.com/sirupsen/logrus"
+
+	pluginversion "github.com/drone-plugins/drone-docker/version"
 )
 
 func main() {
+	logrus.WithField("version", pluginversion.Version).Info("starting drone-heroku")
+
 	// Load env-file if it exists first
 	if env := os.Getenv("PLUGIN_ENV_FILE"); env != "" {
 		godotenv.Load(env)

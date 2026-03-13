@@ -21,11 +21,15 @@ import (
 	"github.com/sirupsen/logrus"
 
 	docker "github.com/drone-plugins/drone-docker"
+	pluginversion "github.com/drone-plugins/drone-docker/version"
 )
 
 const defaultRegion = "us-east-1"
 
 func main() {
+	logrus.WithField("version", pluginversion.Version).Info("starting drone-ecr")
+
+	// Load env-file if it exists first
 	if env := os.Getenv("PLUGIN_ENV_FILE"); env != "" {
 		godotenv.Load(env)
 	}

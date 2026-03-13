@@ -12,6 +12,7 @@ import (
 
 	docker "github.com/drone-plugins/drone-docker"
 	"github.com/drone-plugins/drone-docker/internal/gcp"
+	pluginversion "github.com/drone-plugins/drone-docker/version"
 
 	"github.com/joho/godotenv"
 	"github.com/sirupsen/logrus"
@@ -86,6 +87,8 @@ func loadConfig() Config {
 }
 
 func main() {
+	logrus.WithField("version", pluginversion.Version).Info("starting drone-gcr")
+
 	config := loadConfig()
 	if config.AccessToken != "" {
 		os.Setenv("ACCESS_TOKEN", config.AccessToken)
